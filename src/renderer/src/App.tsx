@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import type { CustomSound } from '../../preload/customSoundsIpc'
 import { audioEngine } from './audio/engine'
 import AboutModal from './components/AboutModal'
 import Modal from './components/Modal'
 import SelectedKeyCard from './components/SelectedKeyCard'
 import SettingsModal from './components/SettingsModal'
+import SoundLibraryModal, { type SoundUploadOutcome } from './components/SoundLibraryModal'
 import SoundModal from './components/SoundModal'
 import VirtualKeyboard from './components/VirtualKeyboard'
 import VolumeControl from './components/VolumeControl'
@@ -12,21 +14,26 @@ import { DEFAULT_SELECTED_KEY_ID, getKeyDefinition, getKeyDefinitionByCode } fro
 import {
   assignSound,
   countCustomSounds,
-  getAssignedSoundId,
   hasCustomSound,
   resetAllSounds,
   resetKeySound,
   type SoundAssignments
 } from './data/soundAssignments'
-import { DEFAULT_SOUND_ID, getSoundPreset } from './data/sounds'
+import {
+  buildCustomSoundIndex,
+  getSoundDisplayName,
+  resolveEffectiveSoundId
+} from './data/soundResolution'
+import { DEFAULT_SOUND_ID } from './data/sounds'
 import { useTheme, type ThemeMode } from './hooks/useTheme'
-import { SETTINGS_DEFAULTS, type SoundPresetId } from '../../preload/settingsIpc'
+import { SETTINGS_DEFAULTS } from '../../preload/settingsIpc'
 
 function App(): React.JSX.Element {
   // The main process hands over the saved settings with the window, so the
   // first paint already matches what the user configured.
   const settingsApi = window.api?.settings
   const initialSettings = settingsApi?.initial ?? SETTINGS_DEFAULTS
+  const soundsApi = window.api?.customSounds
 
   // Nothing to load when the bridge is absent; when a snapshot is present the
   // UI can render saved values immediately and reconcile in the background.
@@ -35,6 +42,7 @@ function App(): React.JSX.Element {
   const [assignedSounds, setAssignedSounds] = useState<SoundAssignments>(
     initialSettings.soundAssignments
   )
+  const [customSounds, setCustomSounds] = useState<CustomSound[]>(soundsApi?.initial ?? [])
   const [pressedKeys, setPressedKeys] = useState<ReadonlySet<string>>(() => new Set())
   const [volume, setVolume] = useState(initialSettings.masterVolume)
   const [muted, setMuted] = useState(initialSettings.muted)
@@ -45,6 +53,7 @@ function App(): React.JSX.Element {
   const [theme, setTheme] = useState<ThemeMode>(initialSettings.theme)
 
   const [soundModalOpen, setSoundModalOpen] = useState(false)
+  const [soundLibraryOpen, setSoundLibraryOpen] = useState(false)
   const [resetAllOpen, setResetAllOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [aboutOpen, setAboutOpen] = useState(false)
@@ -54,6 +63,11 @@ function App(): React.JSX.Element {
   const assignedSoundsRef = useRef(assignedSounds)
   const soundsEnabledRef = useRef(soundsEnabled)
   const defaultSoundIdRef = useRef(defaultSoundId)
+
+  // Ids of the custom sounds that are actually usable right now. Everything
+  // that resolves a sound consults this, so a missing file never plays.
+  const customSoundIndex = useMemo(() => buildCustomSoundIndex(customSounds), [customSounds])
+  const customSoundIndexRef = useRef(customSoundIndex)
 
   useLayoutEffect(() => {
     audioEngine.setEnabled(soundsEnabled)
@@ -67,11 +81,22 @@ function App(): React.JSX.Element {
     assignedSoundsRef.current = assignedSounds
     soundsEnabledRef.current = soundsEnabled
     defaultSoundIdRef.current = defaultSoundId
-  }, [assignedSounds, soundsEnabled, defaultSoundId])
+    customSoundIndexRef.current = customSoundIndex
+  }, [assignedSounds, soundsEnabled, defaultSoundId, customSoundIndex])
 
   useEffect(() => {
     return () => {
       void audioEngine.dispose()
+    }
+  }, [])
+
+  // The engine stays decoupled from IPC: hand it a loader for custom bytes.
+  useEffect(() => {
+    const api = window.api?.customSounds
+    audioEngine.setCustomSoundLoader(api ? (soundId) => api.read(soundId) : null)
+
+    return () => {
+      audioEngine.setCustomSoundLoader(null)
     }
   }, [])
 
@@ -108,6 +133,27 @@ function App(): React.JSX.Element {
     }
   }, [])
 
+  // Load the custom sound library once; the snapshot covers the first paint.
+  useEffect(() => {
+    const api = window.api?.customSounds
+    if (!api) return
+
+    let active = true
+
+    api
+      .list()
+      .then((list) => {
+        if (active) setCustomSounds(list)
+      })
+      .catch((error) => {
+        console.warn('[KeyBeep] The sound library could not be loaded.', error)
+      })
+
+    return () => {
+      active = false
+    }
+  }, [])
+
   // Persist every change immediately by sending the full snapshot. This keeps a
   // single source of truth and avoids per-handler persistence gaps.
   useEffect(() => {
@@ -122,8 +168,8 @@ function App(): React.JSX.Element {
         soundsEnabled,
         masterVolume: volume,
         muted,
-        defaultSoundId: defaultSoundId as SoundPresetId,
-        soundAssignments: assignedSounds as Record<string, SoundPresetId>,
+        defaultSoundId,
+        soundAssignments: assignedSounds,
         launchAtStartup,
         minimizeToTray,
         theme
@@ -154,6 +200,20 @@ function App(): React.JSX.Element {
     minimizeToTray,
     theme
   ])
+
+  // Decode the custom sounds that are actually referenced so presses never wait
+  // on disk or IPC. Re-runs whenever the library or the assignments change.
+  useEffect(() => {
+    if (!settingsLoaded) return
+
+    const referenced = new Set<string>()
+    if (customSoundIndex.has(defaultSoundId)) referenced.add(defaultSoundId)
+    for (const soundId of Object.values(assignedSounds)) {
+      if (customSoundIndex.has(soundId)) referenced.add(soundId)
+    }
+
+    if (referenced.size > 0) void audioEngine.preloadCustomSounds([...referenced])
+  }, [settingsLoaded, customSoundIndex, defaultSoundId, assignedSounds])
 
   // The native hook is the only path for physical key presses. It starts when
   // sounds are enabled and stops (releasing the OS listener) when disabled.
@@ -191,8 +251,8 @@ function App(): React.JSX.Element {
     }
   }, [soundsEnabled, settingsLoaded])
 
-  // Subscribe once; refs keep the latest assignments and enabled state without
-  // re-subscribing or re-rendering the keyboard tree on every key press.
+  // Subscribe once; refs keep the latest assignments, library and enabled state
+  // without re-subscribing or re-rendering the keyboard tree on every press.
   useEffect(() => {
     const keyboard = window.api?.keyboard
     if (!keyboard) return
@@ -214,7 +274,12 @@ function App(): React.JSX.Element {
       }
 
       audioEngine.play(
-        getAssignedSoundId(assignedSoundsRef.current, key.code, defaultSoundIdRef.current)
+        resolveEffectiveSoundId(
+          assignedSoundsRef.current,
+          key.code,
+          defaultSoundIdRef.current,
+          customSoundIndexRef.current
+        )
       )
       setPressedKeys((previous) => {
         if (previous.has(key.id)) return previous
@@ -236,8 +301,13 @@ function App(): React.JSX.Element {
   }, [])
 
   const selectedKey = getKeyDefinition(selectedKeyId)
-  const selectedSoundId = getAssignedSoundId(assignedSounds, selectedKey.code, defaultSoundId)
-  const selectedSound = getSoundPreset(selectedSoundId)
+  const selectedSoundId = resolveEffectiveSoundId(
+    assignedSounds,
+    selectedKey.code,
+    defaultSoundId,
+    customSoundIndex
+  )
+  const selectedSoundName = getSoundDisplayName(selectedSoundId, customSounds)
   const selectedHasCustomSound = hasCustomSound(assignedSounds, selectedKey.code)
   const customSoundCount = countCustomSounds(assignedSounds)
   const isMuted = muted || volume === 0
@@ -260,9 +330,11 @@ function App(): React.JSX.Element {
   const handlePlayKey = useCallback(
     (keyId: string) => {
       const key = getKeyDefinition(keyId)
-      audioEngine.play(getAssignedSoundId(assignedSounds, key.code, defaultSoundId))
+      audioEngine.play(
+        resolveEffectiveSoundId(assignedSounds, key.code, defaultSoundId, customSoundIndex)
+      )
     },
-    [assignedSounds, defaultSoundId]
+    [assignedSounds, defaultSoundId, customSoundIndex]
   )
 
   const handleOpenSoundModal = useCallback(() => {
@@ -315,16 +387,13 @@ function App(): React.JSX.Element {
     setAssignedSounds((previous) => resetKeySound(previous, selectedKey.code))
   }, [selectedKey.code])
 
-  /** Applies the chosen default to every button and persists it. */
-  const handleDefaultSoundChange = useCallback(
-    (soundId: string) => {
-      // Re-selecting the active default must not discard per-key customizations.
-      if (soundId === defaultSoundId) return
-      setDefaultSoundId(soundId)
-      setAssignedSounds(resetAllSounds())
-    },
-    [defaultSoundId]
-  )
+  /**
+   * Applies the chosen global sound to every button that has no individual
+   * override. Individual overrides are intentionally left untouched.
+   */
+  const handleDefaultSoundChange = useCallback((soundId: string) => {
+    setDefaultSoundId((current) => (current === soundId ? current : soundId))
+  }, [])
 
   /** Restores every button to the original default; touches nothing else. */
   const handleResetAllSounds = useCallback(() => {
@@ -336,6 +405,65 @@ function App(): React.JSX.Element {
   const handleRequestResetAll = useCallback(() => {
     setSettingsOpen(false)
     setResetAllOpen(true)
+  }, [])
+
+  const handleOpenLibrary = useCallback(() => {
+    setSoundModalOpen(false)
+    setSettingsOpen(false)
+    setSoundLibraryOpen(true)
+    void audioEngine.preload()
+  }, [])
+
+  const handlePreviewCustomSound = useCallback((soundId: string) => {
+    audioEngine.play(soundId)
+  }, [])
+
+  const handleUploadSound = useCallback(async (file: File): Promise<SoundUploadOutcome> => {
+    const api = window.api?.customSounds
+    if (!api) return { ok: false, message: 'The sound library is unavailable.' }
+
+    try {
+      const data = new Uint8Array(await file.arrayBuffer())
+      const result = await api.upload({ fileName: file.name, data })
+
+      if (result.ok) {
+        setCustomSounds(result.sounds)
+        return { ok: true }
+      }
+
+      return { ok: false, message: result.message }
+    } catch (error) {
+      console.warn('[KeyBeep] The sound could not be uploaded.', error)
+      return { ok: false, message: 'The sound could not be uploaded.' }
+    }
+  }, [])
+
+  const handleRenameSound = useCallback(async (soundId: string, name: string) => {
+    const api = window.api?.customSounds
+    if (!api) return
+
+    try {
+      setCustomSounds(await api.rename(soundId, name))
+    } catch (error) {
+      console.warn('[KeyBeep] The sound could not be renamed.', error)
+    }
+  }, [])
+
+  const handleDeleteSound = useCallback(async (soundId: string) => {
+    const api = window.api?.customSounds
+    if (!api) return
+
+    try {
+      // The main process removes the file, the metadata and every reference in
+      // one locked step, so no dangling assignment can remain.
+      const result = await api.remove(soundId)
+      setCustomSounds(result.sounds)
+      setDefaultSoundId(result.settings.defaultSoundId)
+      setAssignedSounds(result.settings.soundAssignments)
+      audioEngine.releaseSound(soundId)
+    } catch (error) {
+      console.warn('[KeyBeep] The sound could not be deleted.', error)
+    }
   }, [])
 
   const handleVolumeChange = (nextVolume: number): void => {
@@ -412,7 +540,7 @@ function App(): React.JSX.Element {
         <div className="grid flex-none gap-3 md:grid-cols-[minmax(0,1fr)_300px]">
           <SelectedKeyCard
             keyDefinition={selectedKey}
-            soundName={selectedSound.name}
+            soundName={selectedSoundName}
             hasCustomSound={selectedHasCustomSound}
             onConfigure={handleOpenSoundModal}
           />
@@ -491,12 +619,29 @@ function App(): React.JSX.Element {
           keyDefinition={selectedKey}
           currentSoundId={selectedSoundId}
           defaultSoundId={defaultSoundId}
+          customSounds={customSounds}
           hasCustomSound={selectedHasCustomSound}
           soundsEnabled={soundsEnabled}
           onApply={handleApplySound}
           onPreview={handlePreviewSound}
           onReset={handleResetSelectedSound}
+          onManageLibrary={handleOpenLibrary}
           onClose={() => setSoundModalOpen(false)}
+        />
+      ) : null}
+
+      {soundLibraryOpen ? (
+        <SoundLibraryModal
+          sounds={customSounds}
+          globalSoundId={defaultSoundId}
+          assignments={assignedSounds}
+          soundsEnabled={soundsEnabled}
+          onUpload={handleUploadSound}
+          onRename={handleRenameSound}
+          onDelete={handleDeleteSound}
+          onSetGlobal={handleDefaultSoundChange}
+          onPreview={handlePreviewCustomSound}
+          onClose={() => setSoundLibraryOpen(false)}
         />
       ) : null}
 
@@ -545,7 +690,9 @@ function App(): React.JSX.Element {
           onMinimizeToTrayChange={setMinimizeToTray}
           defaultSoundId={defaultSoundId}
           onDefaultSoundChange={handleDefaultSoundChange}
+          customSounds={customSounds}
           customSoundCount={customSoundCount}
+          onManageLibrary={handleOpenLibrary}
           onResetAllSounds={handleRequestResetAll}
           theme={theme}
           resolvedTheme={resolvedTheme}

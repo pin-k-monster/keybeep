@@ -4,6 +4,12 @@ import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import pngIcon from '../../resources/icon.png?asset'
 import icon from '../../resources/icon.ico?asset'
 import { disposeKeyboardHook, registerKeyboardHookIpc } from './keyboardHook'
+import {
+  disposeCustomSounds,
+  getCustomSounds,
+  initializeCustomSounds,
+  registerCustomSoundsIpc
+} from './customSounds'
 import { disposeSettings, getSettings, initializeSettings, registerSettingsIpc } from './settings'
 import { attachMainWindow, disposeTray, initializeTray } from './tray'
 
@@ -21,7 +27,8 @@ function createWindow(): void {
       contextIsolation: true,
       nodeIntegration: false,
       additionalArguments: [
-        `--keybeep-initial-settings=${encodeURIComponent(JSON.stringify(getSettings()))}`
+        `--keybeep-initial-settings=${encodeURIComponent(JSON.stringify(getSettings()))}`,
+        `--keybeep-initial-sounds=${encodeURIComponent(JSON.stringify(getCustomSounds()))}`
       ]
     }
   })
@@ -68,6 +75,8 @@ app.whenReady().then(() => {
   // persisted configuration on its first paint.
   initializeSettings()
   registerSettingsIpc()
+  initializeCustomSounds()
+  registerCustomSoundsIpc()
   registerKeyboardHookIpc()
   createWindow()
   initializeTray(createWindow)
@@ -83,6 +92,7 @@ app.whenReady().then(() => {
 app.on('will-quit', () => {
   disposeKeyboardHook()
   disposeTray()
+  disposeCustomSounds()
   disposeSettings()
 })
 

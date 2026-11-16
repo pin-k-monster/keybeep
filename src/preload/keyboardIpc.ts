@@ -5,6 +5,7 @@
  * Payloads only ever contain a physical key code and whether it was pressed or
  * released. No typed characters, timestamps, or keyboard history are included.
  */
+import type { CustomSoundsApi } from './customSoundsIpc'
 import type { SettingsApi } from './settingsIpc'
 
 export type KeyboardHookEventType = 'keydown' | 'keyup'
@@ -28,6 +29,7 @@ export interface KeyboardApi {
 export interface KeybeepApi {
   keyboard: KeyboardApi
   settings: SettingsApi
+  customSounds: CustomSoundsApi
 }
 
 export const KEYBOARD_IPC = {

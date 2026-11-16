@@ -179,3 +179,13 @@ export function getSoundPreset(soundId: string): SoundPreset {
   const preset = soundPresets.find((item) => item.id === soundId)
   return preset ?? soundPresets[0]
 }
+
+/** True when the id belongs to a bundled preset (never falls back). */
+export function isBundledSoundId(soundId: string): boolean {
+  return soundPresets.some((preset) => preset.id === soundId)
+}
+
+/** Exact bundled lookup; `null` when the id is not a bundled preset. */
+export function getBundledSoundPreset(soundId: string): SoundPreset | null {
+  return soundPresets.find((preset) => preset.id === soundId) ?? null
+}

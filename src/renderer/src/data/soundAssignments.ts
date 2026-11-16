@@ -47,6 +47,22 @@ export function resetAllSounds(): SoundAssignments {
   return {}
 }
 
+/** Drops every override that points at a deleted sound id. */
+export function removeSoundReferences(
+  assignments: SoundAssignments,
+  soundId: string
+): SoundAssignments {
+  if (!Object.values(assignments).includes(soundId)) return assignments
+
+  const next: Record<string, string> = {}
+  for (const [key, value] of Object.entries(assignments)) {
+    if (value === soundId) continue
+    next[key] = value
+  }
+
+  return next
+}
+
 export function countCustomSounds(assignments: SoundAssignments): number {
   return Object.keys(assignments).length
 }

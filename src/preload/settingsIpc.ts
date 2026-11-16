@@ -25,9 +25,14 @@ export interface PersistedSettings {
   soundsEnabled: boolean
   masterVolume: number
   muted: boolean
-  defaultSoundId: SoundPresetId
+  /**
+   * Global sound used by every button that has no individual override. Either a
+   * bundled preset id or a custom sound id. References are validated before
+   * playback, so a stale id safely falls back to the original default.
+   */
+  defaultSoundId: string
   /** Per-key overrides, keyed by physical `KeyboardEvent.code`. */
-  soundAssignments: Record<string, SoundPresetId>
+  soundAssignments: Record<string, string>
   launchAtStartup: boolean
   minimizeToTray: boolean
   theme: ThemePreference

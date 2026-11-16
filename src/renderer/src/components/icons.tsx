@@ -153,6 +153,36 @@ export function ResetIcon({ size, ...props }: IconProps): JSX.Element {
   )
 }
 
+export function UploadIcon({ size, ...props }: IconProps): JSX.Element {
+  return (
+    <IconBase size={size} {...props}>
+      <path d="M12 15V3" />
+      <path d="m7 8 5-5 5 5" />
+      <path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4" />
+    </IconBase>
+  )
+}
+
+export function TrashIcon({ size, ...props }: IconProps): JSX.Element {
+  return (
+    <IconBase size={size} {...props}>
+      <path d="M4 7h16" />
+      <path d="M10 11v6M14 11v6" />
+      <path d="M6 7l1 13a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-13" />
+      <path d="M9 7V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v3" />
+    </IconBase>
+  )
+}
+
+export function PencilIcon({ size, ...props }: IconProps): JSX.Element {
+  return (
+    <IconBase size={size} {...props}>
+      <path d="M12 20h9" />
+      <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z" />
+    </IconBase>
+  )
+}
+
 export function GithubIcon({ size, ...props }: IconProps): JSX.Element {
   return (
     <IconBase size={size} {...props}>

@@ -2,11 +2,10 @@ import { app, ipcMain } from 'electron'
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import {
+  ORIGINAL_DEFAULT_SOUND_ID,
   SETTINGS_DEFAULTS,
   SETTINGS_IPC,
-  SOUND_PRESET_IDS,
   type PersistedSettings,
-  type SoundPresetId,
   type ThemePreference
 } from '../preload/settingsIpc'
 
@@ -14,6 +13,12 @@ type SettingsListener = (settings: PersistedSettings) => void
 
 const THEME_VALUES: readonly ThemePreference[] = ['system', 'light', 'dark']
 const MAX_ASSIGNMENT_KEY_LENGTH = 48
+/**
+ * Sound references may be a bundled preset id or a custom sound id. The exact
+ * set of valid ids lives with each owner; settings only guarantees a reference
+ * is a safe, non-empty identifier. Stale references fall back at playback.
+ */
+const SOUND_REFERENCE_PATTERN = /^[A-Za-z0-9_-]{1,64}$/
 const SUPPORTS_LOGIN_ITEM = process.platform === 'win32' || process.platform === 'darwin'
 
 let settings: PersistedSettings = cloneSettings(SETTINGS_DEFAULTS)
@@ -25,8 +30,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function isSoundPresetId(value: unknown): value is SoundPresetId {
-  return typeof value === 'string' && (SOUND_PRESET_IDS as readonly string[]).includes(value)
+function isSoundReference(value: unknown): value is string {
+  return typeof value === 'string' && SOUND_REFERENCE_PATTERN.test(value)
 }
 
 function isThemePreference(value: unknown): value is ThemePreference {
@@ -44,16 +49,16 @@ function clampVolume(value: unknown, fallback: number): number {
 
 function sanitizeAssignments(
   value: unknown,
-  fallback: Record<string, SoundPresetId>
-): Record<string, SoundPresetId> {
+  fallback: Record<string, string>
+): Record<string, string> {
   if (!isRecord(value)) return { ...fallback }
 
-  const assignments: Record<string, SoundPresetId> = {}
+  const assignments: Record<string, string> = {}
 
   for (const [key, soundId] of Object.entries(value)) {
     if (key.length === 0 || key.length > MAX_ASSIGNMENT_KEY_LENGTH) continue
     if (!/^[A-Za-z0-9]+$/.test(key)) continue
-    if (!isSoundPresetId(soundId)) continue
+    if (!isSoundReference(soundId)) continue
     assignments[key] = soundId
   }
 
@@ -67,7 +72,7 @@ function sanitizeAssignments(
 function sanitizeSettings(raw: unknown, base: PersistedSettings): PersistedSettings {
   const input = isRecord(raw) ? raw : {}
 
-  const defaultSoundId = isSoundPresetId(input.defaultSoundId)
+  const defaultSoundId = isSoundReference(input.defaultSoundId)
     ? input.defaultSoundId
     : base.defaultSoundId
 
@@ -216,6 +221,34 @@ export function onSettingsChanged(listener: SettingsListener): () => void {
   return () => {
     listeners.delete(listener)
   }
+}
+
+/**
+ * Removes every reference to a sound id from the global default and the per-key
+ * assignments. Used when a custom sound is deleted so no dangling references
+ * remain. Returns the effective settings.
+ */
+export function removeSoundReferences(soundId: string): PersistedSettings {
+  const usedGlobally = settings.defaultSoundId === soundId
+  const usedPerKey = Object.values(settings.soundAssignments).includes(soundId)
+
+  if (!usedGlobally && !usedPerKey) return getSettings()
+
+  const soundAssignments: Record<string, string> = {}
+  for (const [key, value] of Object.entries(settings.soundAssignments)) {
+    if (value === soundId) continue
+    soundAssignments[key] = value
+  }
+
+  settings = {
+    ...settings,
+    defaultSoundId: usedGlobally ? ORIGINAL_DEFAULT_SOUND_ID : settings.defaultSoundId,
+    soundAssignments
+  }
+
+  persistSettings()
+  notifyListeners()
+  return getSettings()
 }
 
 export function registerSettingsIpc(): void {

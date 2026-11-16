@@ -1,7 +1,25 @@
-import { getSoundPreset, soundPresets, type SoundPreset } from '../data/sounds'
+import {
+  DEFAULT_SOUND_ID,
+  getSoundPreset,
+  isBundledSoundId,
+  soundPresets,
+  type SoundPreset
+} from '../data/sounds'
 import { renderSynthBuffer } from './synth'
 
 const VOLUME_RAMP_SECONDS = 0.015
+
+/** Playback shape for a voice, independent of whether it is synth or sample. */
+interface VoiceSettings {
+  gain: number
+  jitter: number
+}
+
+/** Custom samples play at unity gain with only a subtle pitch variation. */
+const CUSTOM_VOICE: VoiceSettings = { gain: 1, jitter: 0.02 }
+
+/** Supplies the raw bytes of a custom sound on demand. */
+export type CustomSoundLoader = (soundId: string) => Promise<ArrayBuffer | null>
 
 interface ActiveVoice {
   source: AudioBufferSourceNode
@@ -31,6 +49,9 @@ export class KeybeepAudioEngine {
   private masterGain: GainNode | null = null
   private buffers = new Map<string, AudioBuffer>()
   private sampleLoads = new Map<string, Promise<void>>()
+  /** Ids that failed to load, so a broken file is not retried on every press. */
+  private failedCustom = new Set<string>()
+  private customSoundLoader: CustomSoundLoader | null = null
   private activeVoices = new Set<ActiveVoice>()
   private volume = 0.72
   private muted = false
@@ -70,15 +91,51 @@ export class KeybeepAudioEngine {
     if (!enabled) this.stopAllVoices()
   }
 
-  /** Plays a preset. Safe to call rapidly; each call gets its own voice. */
+  /**
+   * Registers the source of custom sound bytes. The engine stays decoupled from
+   * IPC: the renderer wires this to the preload bridge once.
+   */
+  setCustomSoundLoader(loader: CustomSoundLoader | null): void {
+    this.customSoundLoader = loader
+  }
+
+  /** Plays a sound id. Bundled presets and custom samples are both supported. */
   play(soundId: string): void {
     if (!this.enabled || this.muted || this.volume === 0) return
 
     const context = this.ensureContext()
     if (!context) return
 
-    void this.playPreset(context, getSoundPreset(soundId))
+    if (isBundledSoundId(soundId)) {
+      void this.playPreset(context, getSoundPreset(soundId))
+    } else {
+      void this.playCustom(context, soundId)
+    }
     this.warmLibrary()
+  }
+
+  /**
+   * Decodes the given custom sounds ahead of time. Called when the library or
+   * the assignments change so key presses never wait on disk or IPC.
+   */
+  async preloadCustomSounds(soundIds: readonly string[]): Promise<void> {
+    if (!this.enabled || soundIds.length === 0) return
+
+    const context = this.ensureContext()
+    if (!context) return
+
+    // An explicit request is also a retry, so previously failed ids are cleared.
+    for (const soundId of soundIds) this.failedCustom.delete(soundId)
+
+    await this.ensureRunning(context)
+    await Promise.all(soundIds.map((soundId) => this.resolveCustomBuffer(soundId)))
+  }
+
+  /** Releases a decoded sample, for example after its sound was deleted. */
+  releaseSound(soundId: string): void {
+    this.buffers.delete(soundId)
+    this.sampleLoads.delete(soundId)
+    this.failedCustom.delete(soundId)
   }
 
   /** Creates the context if needed and renders every preset into memory. */
@@ -120,6 +177,7 @@ export class KeybeepAudioEngine {
     this.masterGain = null
     this.buffers.clear()
     this.sampleLoads.clear()
+    this.failedCustom.clear()
     this.libraryWarm = false
     this.contextUnavailable = false
 
@@ -173,10 +231,73 @@ export class KeybeepAudioEngine {
       const buffer = await this.resolveBuffer(preset)
       if (!buffer || !this.enabled || this.muted || context.state !== 'running') return
 
-      this.startVoice(context, preset, buffer)
+      this.startVoice(context, buffer, {
+        gain: preset.gain,
+        jitter: preset.synthesis.jitter ?? 0.02
+      })
     } catch (error) {
       this.warn('The keyboard sound could not be played.', error)
     }
+  }
+
+  /**
+   * Plays a user-uploaded sample. If the file is missing, corrupt or the bridge
+   * is unavailable, the original bundled default is played instead so a press
+   * never goes silent or throws.
+   */
+  private async playCustom(context: AudioContext, soundId: string): Promise<void> {
+    try {
+      await this.ensureRunning(context)
+      if (!this.enabled || this.muted || context.state !== 'running') return
+
+      const buffer = await this.resolveCustomBuffer(soundId)
+      if (!buffer || !this.enabled || this.muted || context.state !== 'running') return
+
+      this.startVoice(context, buffer, CUSTOM_VOICE)
+    } catch (error) {
+      this.warn('The custom keyboard sound could not be played.', error)
+    }
+  }
+
+  private async resolveCustomBuffer(soundId: string): Promise<AudioBuffer | null> {
+    const cached = this.buffers.get(soundId)
+    if (cached) return cached
+
+    const loader = this.customSoundLoader
+    if (!loader) return this.fallbackBuffer()
+
+    if (this.failedCustom.has(soundId)) return this.fallbackBuffer()
+
+    const pending = this.sampleLoads.get(soundId)
+    if (pending) {
+      await pending
+      return this.buffers.get(soundId) ?? this.fallbackBuffer()
+    }
+
+    const task = (async () => {
+      const data = await loader(soundId)
+      if (!data) return
+      await this.loadSample(soundId, data)
+    })()
+
+    this.sampleLoads.set(soundId, task)
+
+    try {
+      await task
+    } finally {
+      this.sampleLoads.delete(soundId)
+    }
+
+    const buffer = this.buffers.get(soundId)
+    if (buffer) return buffer
+
+    // Remember the failure so rapid presses do not re-read a broken file.
+    this.failedCustom.add(soundId)
+    return this.fallbackBuffer()
+  }
+
+  private async fallbackBuffer(): Promise<AudioBuffer | null> {
+    return this.resolveBuffer(getSoundPreset(DEFAULT_SOUND_ID))
   }
 
   private async ensureRunning(context: AudioContext): Promise<void> {
@@ -189,7 +310,7 @@ export class KeybeepAudioEngine {
     }
   }
 
-  private startVoice(context: AudioContext, preset: SoundPreset, buffer: AudioBuffer): void {
+  private startVoice(context: AudioContext, buffer: AudioBuffer, settings: VoiceSettings): void {
     const masterGain = this.masterGain
     if (!masterGain) return
 
@@ -197,11 +318,10 @@ export class KeybeepAudioEngine {
       const source = context.createBufferSource()
       source.buffer = buffer
 
-      const jitter = preset.synthesis.jitter ?? 0.02
-      source.playbackRate.value = 1 + (Math.random() * 2 - 1) * jitter
+      source.playbackRate.value = 1 + (Math.random() * 2 - 1) * settings.jitter
 
       const gain = context.createGain()
-      gain.gain.value = preset.gain * (0.94 + Math.random() * 0.12)
+      gain.gain.value = settings.gain * (0.94 + Math.random() * 0.12)
 
       let panner: StereoPannerNode | null = null
       if (typeof context.createStereoPanner === 'function') {
